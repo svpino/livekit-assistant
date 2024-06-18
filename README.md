@@ -26,4 +26,4 @@ $ python3 assistant.py download-files
 $ python3 assistant.py start
 ```
 
-Finally, you can load the [hosted playground](https://agents-playground.livekit.io/).
+Finally, you can load the [hosted playground](https://agents-playground.livekit.io/) and connect it.
