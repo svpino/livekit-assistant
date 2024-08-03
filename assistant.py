@@ -1,141 +1,122 @@
 import asyncio
-from typing import Annotated
-
-from livekit import agents, rtc
-from livekit.agents import JobContext, JobRequest, WorkerOptions, cli, tokenize, tts
-from livekit.agents.llm import (
-    ChatContext,
-    ChatImage,
-    ChatMessage,
-    ChatRole,
-)
-from livekit.agents.voice_assistant import AssistantContext, VoiceAssistant
+import logging
+from dotenv import load_dotenv
+from typing import Any
+from livekit import rtc
+from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli, llm
+from livekit.agents.voice_assistant import VoiceAssistant
 from livekit.plugins import deepgram, openai, silero
 
+load_dotenv()
 
-class AssistantFunction(agents.llm.FunctionContext):
-    """This class is used to define functions that will be called by the assistant."""
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("livekit-agent")
 
-    @agents.llm.ai_callable(
-        desc=(
-            "Called when asked to evaluate something that would require vision capabilities,"
-            "for example, an image, video, or the webcam feed."
-        )
-    )
-    async def image(
-        self,
-        user_msg: Annotated[
-            str,
-            agents.llm.TypeInfo(desc="The user message that triggered this function"),
-        ],
-    ):
-        print(f"Message triggering vision capabilities: {user_msg}")
-        context = AssistantContext.get_current()
-        context.store_metadata("user_msg", user_msg)
+class AssistantFnc(llm.FunctionContext):
+    def __init__(self, chat_ctx: Any) -> None:
+        super().__init__()
+        self.room: Any = None
+        self.latest_video_frame: Any = None
+        self.chat_ctx: Any = chat_ctx
 
+    async def process_video_stream(self, track):
+        """Process video stream and store the first video frame."""
+        logger.info(f"Starting to process video track: {track.sid}")
+        video_stream = rtc.VideoStream(track)
+        try:
+            async for frame_event in video_stream:
+                self.latest_video_frame = frame_event.frame
+                logger.info(f"Received a frame from track {track.sid}")
+                break  # Process only the first frame
+        except Exception as e:
+            logger.error(f"Error processing video stream: {e}")
 
-async def get_video_track(room: rtc.Room):
-    """Get the first video track from the room. We'll use this track to process images."""
+    @llm.ai_callable()
+    async def capture_and_add_image(self) -> str:
+        """Capture an image from the video stream and add it to the chat context."""
+        if self.chat_ctx is None:
+            logger.error("chat_ctx is not set")
+            return "Error: chat_ctx is not set"
 
-    video_track = asyncio.Future[rtc.RemoteVideoTrack]()
+        video_publication = self._get_video_publication()
+        if not video_publication:
+            logger.info("No video track available")
+            return "No video track available"
 
-    for _, participant in room.participants.items():
-        for _, track_publication in participant.tracks.items():
-            if track_publication.track is not None and isinstance(
-                track_publication.track, rtc.RemoteVideoTrack
-            ):
-                video_track.set_result(track_publication.track)
-                print(f"Using video track {track_publication.track.sid}")
+        try:
+            await self._subscribe_and_capture_frame(video_publication)
+            if not self.latest_video_frame:
+                logger.info("No video frame available")
+                return "No video frame available"
+
+            chat_image = llm.ChatImage(image=self.latest_video_frame)
+            self.chat_ctx.append(images=[chat_image], role="user")
+            return f"Image captured and added to context. Dimensions: {self.latest_video_frame.width}x{self.latest_video_frame.height}"
+        except Exception as e:
+            logger.error(f"Error in capture_and_add_image: {e}")
+            return f"Error: {e}"
+        finally:
+            self._unsubscribe_from_video(video_publication)
+            self.latest_video_frame = None
+
+    def _get_video_publication(self):
+        """Retrieve the first available video publication."""
+        for participant in self.room.remote_participants.values():
+            for publication in participant.track_publications.values():
+                if publication.kind == rtc.TrackKind.KIND_VIDEO:
+                    return publication
+        return None
+
+    async def _subscribe_and_capture_frame(self, publication):
+        """Subscribe to the video publication and wait for a frame to be processed."""
+        publication.set_subscribed(True)
+        for _ in range(10):  # Wait up to 5 seconds
+            if self.latest_video_frame:
                 break
+            await asyncio.sleep(0.5)
 
-    return await video_track
-
+    def _unsubscribe_from_video(self, publication):
+        """Unsubscribe from the video publication."""
+        if publication:
+            publication.set_subscribed(False)
 
 async def entrypoint(ctx: JobContext):
-    print(f"Room name: {ctx.room.name}")
+    """Main entry point for the voice assistant job."""
+    try:
+        await ctx.connect(auto_subscribe=AutoSubscribe.SUBSCRIBE_NONE)
+        initial_ctx = llm.ChatContext().append(
+            role="system",
+            text=(
+                "You are a voice assistant created by LiveKit. Your interface with users will be voice. "
+                "You should use short and concise responses. If the user asks you to use their camera, use the capture_and_add_image function."
+            ),
+        )
+        fnc_ctx = AssistantFnc(chat_ctx=initial_ctx)
+        fnc_ctx.room = ctx.room
 
-    chat_context = ChatContext(
-        messages=[
-            ChatMessage(
-                role=ChatRole.SYSTEM,
-                text=(
-                    "Your name is Alloy. You are a funny, witty bot. Your interface with users will be voice and vision."
-                    "Respond with short and concise answers. Avoid using unpronouncable punctuation or emojis."
-                ),
-            )
-        ]
-    )
+        @ctx.room.on("track_subscribed")
+        def on_track_subscribed(track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant):
+            if track.kind == rtc.TrackKind.KIND_VIDEO:
+                asyncio.create_task(fnc_ctx.process_video_stream(track))
 
-    gpt = openai.LLM(model="gpt-4o")
+        assistant = VoiceAssistant(
+            vad=silero.VAD.load(),
+            stt=deepgram.STT(),
+            llm=openai.LLM(model="gpt-4o"),
+            tts=openai.TTS(),
+            chat_ctx=initial_ctx,
+            fnc_ctx=fnc_ctx,
+        )
 
-    # Since OpenAI does not support streaming TTS, we'll use it with a StreamAdapter
-    # to make it compatible with the VoiceAssistant
-    openai_tts = tts.StreamAdapter(
-        tts=openai.TTS(voice="alloy"),
-        sentence_tokenizer=tokenize.basic.SentenceTokenizer(),
-    )
+        assistant.start(ctx.room)
+        await asyncio.sleep(1)
+        await assistant.say("Hey, how can I help you today?", allow_interruptions=True)
 
-    latest_image: rtc.VideoFrame | None = None
+        while True:
+            await asyncio.sleep(10)
 
-    assistant = VoiceAssistant(
-        vad=silero.VAD(),  # We'll use Silero's Voice Activity Detector (VAD)
-        stt=deepgram.STT(),  # We'll use Deepgram's Speech To Text (STT)
-        llm=gpt,
-        tts=openai_tts,  # We'll use OpenAI's Text To Speech (TTS)
-        fnc_ctx=AssistantFunction(),
-        chat_ctx=chat_context,
-    )
-
-    chat = rtc.ChatManager(ctx.room)
-
-    async def _answer(text: str, use_image: bool = False):
-        """
-        Answer the user's message with the given text and optionally the latest
-        image captured from the video track.
-        """
-        args = {}
-        if use_image and latest_image:
-            args["images"] = [ChatImage(image=latest_image)]
-
-        chat_context.messages.append(ChatMessage(role=ChatRole.USER, text=text, **args))
-
-        stream = await gpt.chat(chat_context)
-        await assistant.say(stream, allow_interruptions=True)
-
-        await assistant.say(stream)
-
-    @chat.on("message_received")
-    def on_message_received(msg: rtc.ChatMessage):
-        """This event triggers whenever we get a new message from the user."""
-
-        if msg.message:
-            asyncio.create_task(_answer(msg.message, use_image=False))
-
-    @assistant.on("function_calls_finished")
-    def on_function_calls_finished(ctx: AssistantContext):
-        """This event triggers when an assistant's function call completes."""
-
-        user_msg = ctx.get_metadata("user_msg")
-        if user_msg:
-            asyncio.create_task(_answer(user_msg, use_image=True))
-
-    assistant.start(ctx.room)
-
-    await asyncio.sleep(1)
-    await assistant.say("Hi there! How can I help?", allow_interruptions=True)
-
-    while ctx.room.connection_state == rtc.ConnectionState.CONN_CONNECTED:
-        video_track = await get_video_track(ctx.room)
-
-        async for event in rtc.VideoStream(video_track):
-            # We'll continually grab the latest image from the video track
-            # and store it in a variable.
-            latest_image = event.frame
-
-
-async def request_fnc(req: JobRequest) -> None:
-    await req.accept(entrypoint)
-
+    except Exception as e:
+        logger.error(f"An error occurred: {e}", exc_info=True)
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(request_fnc))
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
