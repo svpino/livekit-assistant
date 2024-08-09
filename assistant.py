@@ -1,15 +1,29 @@
-import asyncio
-from typing import Annotated
-
-from livekit import agents, rtc
-from livekit.agents import JobContext, WorkerOptions, cli, tokenize, tts
+from livekit.plugins import deepgram, openai, silero
+from livekit.agents.voice_assistant import VoiceAssistant
 from livekit.agents.llm import (
     ChatContext,
     ChatImage,
     ChatMessage,
 )
-from livekit.agents.voice_assistant import VoiceAssistant
-from livekit.plugins import deepgram, openai, silero
+from livekit.agents import JobContext, WorkerOptions, cli, tokenize, tts
+from livekit import agents, rtc
+import asyncio
+from typing import Annotated
+
+from dotenv import load_dotenv
+import os
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Access the variables
+# Access the variables
+LIVEKIT_API_SECRET = os.getenv('LIVEKIT_API_SECRET')
+LIVEKIT_API_KEY = os.getenv('LIVEKIT_API_KEY')
+LIVEKIT_URL = os.getenv('LIVEKIT_URL')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+GROQ_API_KEY = os.getenv('GROQ_API_KEY')
+DEEPGRAM_API_KEY = os.getenv('DEEPGRAM_API_KEY')
 
 
 class AssistantFunction(agents.llm.FunctionContext):
